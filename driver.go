@@ -111,8 +111,8 @@ import (
 type role int
 
 const (
-	masterRole role = iota
-	slaveRole
+	MASTER_ROLE role = iota
+	SLAVE_ROLE
 )
 
 var (
@@ -218,18 +218,15 @@ func (d *ProxyDriver) Open(name string) (driver.Conn, error) {
 			}
 			var dbHandles []*sql.DB
 			var has bool
+			role := MASTER_ROLE
 			if fragment == "slave" {
-				if dbHandles, has = d.dbHandlesMap[slaveRole]; !has {
-					dbHandles = make([]*sql.DB, 0)
-					d.dbHandlesMap[slaveRole] = dbHandles
-				}
-			} else {
-				if dbHandles, has = d.dbHandlesMap[masterRole]; !has {
-					dbHandles = make([]*sql.DB, 0)
-					d.dbHandlesMap[masterRole] = dbHandles
-				}
+				role = SLAVE_ROLE
 			}
-			dbHandles = append(dbHandles, db)
+			if dbHandles, has = d.dbHandlesMap[role]; !has {
+				dbHandles = make([]*sql.DB, 0)
+				d.dbHandlesMap[role] = dbHandles
+			}
+			d.dbHandlesMap[role] = append(dbHandles, db)
 		}
 	}
 
@@ -251,14 +248,14 @@ func (c *ProxyConn) Prepare(query string) (driver.Stmt, error) {
 	var stepping *uint32
 	if strings.HasPrefix(queryLower, "select ") {
 		stepping = &slaveCounter
-		dbHandles, has = c.driver.dbHandlesMap[slaveRole]
+		dbHandles, has = c.driver.dbHandlesMap[SLAVE_ROLE]
 		dbHandleSize = len(dbHandles)
 		if has && dbHandleSize == 0 {
-			dbHandles = c.driver.dbHandlesMap[masterRole] // using master's db handles if no slave db provided
+			dbHandles = c.driver.dbHandlesMap[MASTER_ROLE] // using master's db handles if no slave db provided
 			dbHandleSize = len(dbHandles)
 			stepping = &masterCounter
 		} else {
-			dbHandles = c.driver.dbHandlesMap[masterRole]
+			dbHandles = c.driver.dbHandlesMap[MASTER_ROLE]
 			dbHandleSize = len(dbHandles)
 			stepping = &masterCounter
 		}
@@ -266,10 +263,11 @@ func (c *ProxyConn) Prepare(query string) (driver.Stmt, error) {
 			return nil, errors.New("has no opened DB, how could this happen!?")
 		}
 	} else {
-		dbHandles, has = c.driver.dbHandlesMap[masterRole]
+		dbHandles, has = c.driver.dbHandlesMap[MASTER_ROLE]
+		Debug("dbHandles:%v | has: %t", dbHandles, has)
 		dbHandleSize = len(dbHandles)
 		if !has || dbHandleSize == 0 {
-			return nil, errors.New("has no master DB, cannot proceed SQL write operation: " + query)
+			return nil, errors.New("ster DB, cannot proceed SQL write operation: " + query)
 		}
 		stepping = &masterCounter
 	}
@@ -306,7 +304,7 @@ func (c *ProxyConn) Close() (err error) {
 func (c *ProxyConn) Begin() (tx driver.Tx, err error) {
 	Debug("enter")
 	var db *sql.DB
-	dbHandles, has := c.driver.dbHandlesMap[masterRole]
+	dbHandles, has := c.driver.dbHandlesMap[MASTER_ROLE]
 	dbHandleSize := len(dbHandles)
 	if !has || dbHandleSize == 0 {
 		return nil, errors.New("has no master DB, cannot BEGIN a TX")
