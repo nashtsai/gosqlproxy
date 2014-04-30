@@ -4,8 +4,11 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"io"
+	"log"
 	"net/url"
+	"runtime"
 	"strings"
 	"sync/atomic"
 )
@@ -151,6 +154,14 @@ func init() {
 	sql.Register("gosqlproxy", &ProxyDriver{})
 }
 
+// Debug prints a debug information to the log with file and line.
+func Debug(format string, a ...interface{}) {
+	_, file, line, _ := runtime.Caller(1)
+	info := fmt.Sprintf(format, a...)
+
+	log.Printf("[gosqlproxy] debug %s:%d %v", file, line, info)
+}
+
 func RegisterDSNTranslator(driverName string, translator func(*url.URL) string) (err error) {
 	driverName = strings.TrimSpace(driverName)
 	if len(driverName) == 0 {
@@ -165,9 +176,9 @@ func RegisterDSNTranslator(driverName string, translator func(*url.URL) string) 
 }
 
 // Only accept DSN common format (http://pear.php.net/manual/en/package.database.db.intro-dsn.php), multiple data sources separated by ';'
-// mysql://[username[:password]@][protocol[(address)]]/dbname[?param1=value1&...&paramN=valueN];mysql://[username[:password]@][protocol[(address)]]/dbname[?param1=value1&...&paramN=valueN]#slave
+// mysql:[username[:password]@][protocol[(address)]]/dbname[?param1=value1&...&paramN=valueN];mysql:[username[:password]@][protocol[(address)]]/dbname[?param1=value1&...&paramN=valueN]#slave
 func (d *ProxyDriver) Open(name string) (driver.Conn, error) {
-
+	Debug("name:%v", name)
 	if d.dbHandlesMap == nil {
 		d.dbHandlesMap = make(map[role][]*sql.DB, 0)
 		dsns := strings.Split(name, ";")
@@ -184,7 +195,7 @@ func (d *ProxyDriver) Open(name string) (driver.Conn, error) {
 				}
 			}
 
-			if len(dnsTranslators) != 0 {
+			if dnsTranslators != nil {
 				if translator, has := dnsTranslators[urlS.Scheme]; has {
 					dataSourceName = translator(urlS)
 				} else {
@@ -192,26 +203,37 @@ func (d *ProxyDriver) Open(name string) (driver.Conn, error) {
 					urlS.Fragment = ""
 					dataSourceName = urlS.String()
 				}
+			} else {
+				urlS.Scheme = ""
+				urlS.Fragment = ""
+
+				dataSourceName = urlS.String()
 			}
+			Debug("real dataSourceName: %v | driver: %v", dataSourceName, driverName)
+
 			db, err := sql.Open(driverName, dataSourceName)
 			if err != nil {
 				d.cleanup()
 				return nil, err
 			}
 			var dbHandles []*sql.DB
+			var has bool
 			if fragment == "slave" {
-				dbHandles = d.dbHandlesMap[slaveRole]
+				if dbHandles, has = d.dbHandlesMap[slaveRole]; !has {
+					dbHandles = make([]*sql.DB, 0)
+					d.dbHandlesMap[slaveRole] = dbHandles
+				}
 			} else {
-				dbHandles = d.dbHandlesMap[masterRole]
+				if dbHandles, has = d.dbHandlesMap[masterRole]; !has {
+					dbHandles = make([]*sql.DB, 0)
+					d.dbHandlesMap[masterRole] = dbHandles
+				}
 			}
 			dbHandles = append(dbHandles, db)
 		}
 	}
 
-	conn := ProxyConn{
-		driver: d,
-	}
-	return &conn, nil
+	return &ProxyConn{driver: d}, nil
 }
 
 func (d *ProxyDriver) cleanup() {
@@ -219,6 +241,7 @@ func (d *ProxyDriver) cleanup() {
 }
 
 func (c *ProxyConn) Prepare(query string) (driver.Stmt, error) {
+	Debug("enter")
 	queryLower := strings.ToLower(query)
 
 	var db *sql.DB
@@ -256,6 +279,7 @@ func (c *ProxyConn) Prepare(query string) (driver.Stmt, error) {
 	} else {
 		db = dbHandles[atomic.AddUint32(stepping, 1)%uint32(dbHandleSize)]
 	}
+	Debug("dbHandleSize:%v, db:%v", dbHandleSize, db)
 
 	sqlStmt, err := db.Prepare(query)
 	if err != nil {
@@ -266,6 +290,7 @@ func (c *ProxyConn) Prepare(query string) (driver.Stmt, error) {
 }
 
 func (c *ProxyConn) Close() (err error) {
+	Debug("enter")
 	if c.tx != nil {
 		// !nashtsai! should I commit tx?
 		c.tx = nil
@@ -279,6 +304,7 @@ func (c *ProxyConn) Close() (err error) {
 }
 
 func (c *ProxyConn) Begin() (tx driver.Tx, err error) {
+	Debug("enter")
 	var db *sql.DB
 	dbHandles, has := c.driver.dbHandlesMap[masterRole]
 	dbHandleSize := len(dbHandles)
@@ -297,12 +323,16 @@ func (c *ProxyConn) Begin() (tx driver.Tx, err error) {
 }
 
 func (s *ProxyStmt) Close() error {
-	s.stmt.Close()
+	Debug("enter")
+	if s.stmt != nil {
+		s.stmt.Close()
+	}
 	s.inputCount = 0
 	return nil
 }
 
 func (s *ProxyStmt) NumInput() int {
+	Debug("enter")
 	return s.inputCount
 }
 
@@ -315,11 +345,13 @@ func values2InterfaceArray(args []driver.Value) []interface{} {
 }
 
 func (s *ProxyStmt) Exec(args []driver.Value) (result driver.Result, err error) {
+	Debug("enter")
 	s.inputCount = len(args)
 	return s.stmt.Exec(values2InterfaceArray(args)...)
 }
 
 func (s *ProxyStmt) Query(args []driver.Value) (driver.Rows, error) {
+	Debug("enter")
 	s.inputCount = len(args)
 	sqlRows, err := s.stmt.Query(values2InterfaceArray(args)...)
 	if err != nil {
@@ -329,6 +361,7 @@ func (s *ProxyStmt) Query(args []driver.Value) (driver.Rows, error) {
 }
 
 func (r *ProxyRows) Columns() []string {
+	Debug("enter")
 	columns, err := r.rows.Columns()
 	if err != nil {
 		panic(err.Error())
@@ -346,7 +379,7 @@ func (r *ProxyRows) Close() error {
 // type customslice2 []interface{}
 
 func (r *ProxyRows) Next(dest []driver.Value) error {
-
+	Debug("enter")
 	if !r.rows.Next() {
 		return io.EOF
 	}
