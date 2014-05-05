@@ -1,3 +1,7 @@
+// Copyright 2014 The Go SQL Proxy Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package gosqlproxy
 
 import (
@@ -326,14 +330,14 @@ func (c *ProxyConn) Begin() (tx driver.Tx, err error) {
 	return
 }
 
-func (s *ProxyStmt) Close() error {
+func (s *ProxyStmt) Close() (err error) {
 	Debug("this: %v | enter", s)
 	if s.stmt != nil {
-		s.stmt.Close()
+		err = s.stmt.Close()
 		s.stmt = nil
 	}
 	s.inputCount = 0
-	return nil
+	return
 }
 
 func (s *ProxyStmt) NumInput() int {
@@ -384,15 +388,13 @@ func (r *ProxyRows) Columns() []string {
 	return columns
 }
 
-func (r *ProxyRows) Close() error {
+func (r *ProxyRows) Close() (err error) {
 	Debug("this: %v | enter", r)
 	if r.rows != nil {
-		err := r.rows.Close()
+		err = r.rows.Close()
 		r.rows = nil
-		return err
-	} else {
-		return nil
 	}
+	return
 }
 
 // type myInterface interface{}
