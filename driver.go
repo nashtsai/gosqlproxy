@@ -116,8 +116,8 @@ import (
 type role int
 
 const (
-	MASTER_ROLE role = iota
-	SLAVE_ROLE
+	masterRole role = iota
+	slaveRole
 )
 
 var (
@@ -226,9 +226,9 @@ func (d *ProxyDriver) Open(name string) (driver.Conn, error) {
 			}
 			var dbHandles []*sql.DB
 			var has bool
-			role := MASTER_ROLE
+			role := masterRole
 			if fragment == "slave" {
-				role = SLAVE_ROLE
+				role = slaveRole
 			}
 			if dbHandles, has = d.dbHandlesMap[role]; !has {
 				dbHandles = make([]*sql.DB, 0)
@@ -257,14 +257,14 @@ func (c *ProxyConn) Prepare(query string) (driver.Stmt, error) {
 	var stepping *uint32
 	if strings.HasPrefix(queryLower, "select ") {
 		stepping = &slaveCounter
-		dbHandles, has = c.driver.dbHandlesMap[SLAVE_ROLE]
+		dbHandles, has = c.driver.dbHandlesMap[slaveRole]
 		dbHandleSize = len(dbHandles)
 		if has && dbHandleSize == 0 {
-			dbHandles = c.driver.dbHandlesMap[MASTER_ROLE] // using master's db handles if no slave db provided
+			dbHandles = c.driver.dbHandlesMap[masterRole] // using master's db handles if no slave db provided
 			dbHandleSize = len(dbHandles)
 			stepping = &masterCounter
 		} else {
-			dbHandles = c.driver.dbHandlesMap[MASTER_ROLE]
+			dbHandles = c.driver.dbHandlesMap[masterRole]
 			dbHandleSize = len(dbHandles)
 			stepping = &masterCounter
 		}
@@ -272,7 +272,7 @@ func (c *ProxyConn) Prepare(query string) (driver.Stmt, error) {
 			return nil, errors.New("has no opened DB, how could this happen!?")
 		}
 	} else {
-		dbHandles, has = c.driver.dbHandlesMap[MASTER_ROLE]
+		dbHandles, has = c.driver.dbHandlesMap[masterRole]
 		Debug("dbHandles:%v | has: %t", dbHandles, has)
 		dbHandleSize = len(dbHandles)
 		if !has || dbHandleSize == 0 {
@@ -314,7 +314,7 @@ func (c *ProxyConn) Close() (err error) {
 func (c *ProxyConn) Begin() (tx driver.Tx, err error) {
 	Debug("this: %v | enter", c)
 	var db *sql.DB
-	dbHandles, has := c.driver.dbHandlesMap[MASTER_ROLE]
+	dbHandles, has := c.driver.dbHandlesMap[masterRole]
 	dbHandleSize := len(dbHandles)
 	if !has || dbHandleSize == 0 {
 		return nil, errors.New("has no master DB, cannot BEGIN a TX")
