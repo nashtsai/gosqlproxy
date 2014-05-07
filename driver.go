@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 )
 
@@ -123,6 +124,7 @@ const (
 var (
 	dnsTranslators              map[string]func(*url.URL) string
 	masterCounter, slaveCounter uint32
+	initOnce                    sync.Once
 	enableDebug                 = false
 )
 
@@ -160,14 +162,19 @@ func init() {
 	sql.Register("gosqlproxy", &ProxyDriver{})
 }
 
-func Init() {
+func regKnownDSNTranslators() {
 
+	// TODO
 	knownDrivers := map[string]func(*url.URL) string{
 		"postgres": func(url *url.URL) string {
 			password, _ := url.User.Password()
 			return fmt.Sprintf("user=%s password=%s dbname=%s %s", url.User.Username(), password, strings.TrimPrefix(url.Path, "/"), url.RawQuery)
 		},
 		"sqlite3": func(url *url.URL) string { return url.Path },
+		"mysql": func(url *url.URL) string {
+			password, _ := url.User.Password()
+			return fmt.Sprintf("%v:%v@%v", url.User.Username(), password, url.RequestURI())
+		},
 	}
 
 	for driverName, v := range knownDrivers {
@@ -221,6 +228,9 @@ func RegisterDSNTranslator(driverName string, translator func(*url.URL) string) 
 // mysql://[username[:password]@][protocol[(address)]]/dbname[?param1=value1&...&paramN=valueN];mysql://[username[:password]@][protocol[(address)]]/dbname[?param1=value1&...&paramN=valueN]#slave
 func (d *ProxyDriver) Open(name string) (driver.Conn, error) {
 	DebugLog("ProxyDriver.Open: %v | name:%v", d, name)
+
+	initOnce.Do(regKnownDSNTranslators)
+
 	if d.dbNameHandlesMap == nil {
 		d.dbNameHandlesMap = make(map[string]map[role][]*sql.DB, 0)
 	}
@@ -337,7 +347,8 @@ func (c *ProxyConn) Prepare(query string) (driver.Stmt, error) {
 	if err != nil {
 		return nil, err
 	} else {
-		return &ProxyStmt{conn: c, stmt: sqlStmt, inputCount: strings.Count(query, "?")}, err
+		// !nashtsai! TODO this required dialect design
+		return &ProxyStmt{conn: c, stmt: sqlStmt, inputCount: strings.Count(query, "?") + strings.Count(query, "$")}, err
 	}
 }
 
