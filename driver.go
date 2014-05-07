@@ -19,6 +19,10 @@ import (
 	"sync/atomic"
 )
 
+// REMARKS: That this driver is a proxy to implemented driver access via sql.DB handle, which leads to
+// a problem that pool size is managed by external sql.DB manager so a separated API is provided for
+// initialize pool size
+
 // type Driver interface {
 //         // Open returns a new connection to the database.
 //         // The name is a string in a driver-specific format.
@@ -122,10 +126,12 @@ const (
 )
 
 var (
-	dsnTranslators              map[string]func(*url.URL) string
-	masterCounter, slaveCounter uint32
-	initOnce                    sync.Once
-	enableDebug                 = false
+	dsnTranslators                   map[string]func(*url.URL) string
+	masterCounter, slaveCounter      uint32
+	initOnce                         sync.Once
+	enableDebug                      = false
+	_maxIdleOpenConns, _maxOpenConns int
+	gDriver                          *ProxyDriver
 )
 
 type ProxyDriver struct {
@@ -133,6 +139,7 @@ type ProxyDriver struct {
 }
 
 type ProxyConn struct {
+	name         string
 	dbHandlesMap *map[role][]*sql.DB
 	tx           *sql.Tx
 	stmt         *ProxyStmt
@@ -159,7 +166,24 @@ type ProxyExecer struct {
 }
 
 func init() {
-	sql.Register("gosqlproxy", &ProxyDriver{})
+	gDriver = &ProxyDriver{}
+	sql.Register("gosqlproxy", gDriver)
+}
+
+func Init(maxIdleOpenConns, maxOpenConns int) {
+	_maxIdleOpenConns = maxIdleOpenConns
+	_maxOpenConns = maxOpenConns
+}
+
+func Close() {
+	for _, v := range gDriver.dbNameHandlesMap {
+		for _, vv := range v {
+			for _, vvv := range vv {
+				vvv.Close()
+			}
+		}
+	}
+	gDriver.dbNameHandlesMap = nil
 }
 
 func regKnownDSNTranslators() {
@@ -278,6 +302,13 @@ func (d *ProxyDriver) Open(name string) (driver.Conn, error) {
 				d.cleanup(name)
 				return nil, err
 			}
+			if _maxIdleOpenConns > 0 {
+				db.SetMaxIdleConns(_maxIdleOpenConns)
+			}
+			if _maxOpenConns > 0 {
+				db.SetMaxOpenConns(_maxOpenConns)
+			}
+
 			var dbHandles []*sql.DB
 			var has bool
 			role := masterRole
@@ -292,7 +323,7 @@ func (d *ProxyDriver) Open(name string) (driver.Conn, error) {
 		}
 	}
 
-	return &ProxyConn{dbHandlesMap: &dbHandlesMap}, nil
+	return &ProxyConn{name: name, dbHandlesMap: &dbHandlesMap}, nil
 }
 
 func (d *ProxyDriver) cleanup(name string) {
@@ -359,7 +390,8 @@ func (c *ProxyConn) Prepare(query string) (driver.Stmt, error) {
 
 func (c *ProxyConn) Close() (err error) {
 	DebugLog("ProxyConn.Close: %v | enter", c)
-	// !nashtsai! still leave
+
+	// !nashtsai! there is problem that we wanna have sql.DB handle remained open as it's pooled implementation
 
 	if c.tx != nil {
 		// !nashtsai! should I commit tx?
