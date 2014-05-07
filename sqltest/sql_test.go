@@ -53,7 +53,7 @@ func (p *pqDB) RunTest(t *testing.T, fn func(params)) {
 	})
 
 	dbName := "gosqltest"
-	db, err := sql.Open("gosqlproxy", fmt.Sprintf("postgres://%s:localhost@bar/%s?sslmode=disable", user, dbName))
+	db, err := sql.Open("gosqlproxy", fmt.Sprintf("postgres://%s@localhost/%s?sslmode=disable", user, dbName))
 	// db, err := sql.Open("postgres", fmt.Sprintf("user=%s password=foo dbname=%s sslmode=disable", user, dbName))
 	if err != nil {
 		t.Fatalf("error connecting: %v", err)
@@ -207,7 +207,7 @@ func (m *myMysqlDB) RunTest(t *testing.T, fn func(params)) {
 
 	gosqlproxy.RegisterDSNTranslator("mymysql", func(url *url.URL) string {
 		password, _ := url.User.Password()
-		return fmt.Sprintf("%s/%s/%s", url.User.Username(), password, strings.TrimPrefix(url.Path, "/"))
+		return fmt.Sprintf("%s/%s/%s", strings.TrimPrefix(url.Path, "/"), url.User.Username(), password)
 	})
 
 	db, err := sql.Open("gosqlproxy", fmt.Sprintf("mymysql://%s:%s@localhost/%s", user, pass, dbName))
@@ -248,8 +248,14 @@ func (m *goMysqlDB) RunTest(t *testing.T, fn func(params)) {
 		pass = "root"
 	}
 	dbName := "gosqltest"
+
+	gosqlproxy.RegisterDSNTranslator("mysql", func(url *url.URL) string {
+		password, _ := url.User.Password()
+		return fmt.Sprintf("%v:%v@%v", url.User.Username(), password, url.RequestURI())
+	})
+
 	// db, err := sql.Open("mysql", fmt.Sprintf("%s:%s@/%s", user, pass, dbName))
-	db, err := sql.Open("gosqlproxy", fmt.Sprintf("mysql://%s:%s@/%s", user, pass, dbName))
+	db, err := sql.Open("gosqlproxy", fmt.Sprintf("mysql://%s:%s@localhost/%s", user, pass, dbName))
 	if err != nil {
 		t.Fatalf("error connecting: %v", err)
 	}
