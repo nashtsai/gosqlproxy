@@ -1,0 +1,520 @@
+package sqltest
+
+import (
+	"database/sql"
+	"fmt"
+	"github.com/nashtsai/gosqlproxy"
+	"io/ioutil"
+	"math/rand"
+	"net"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+)
+
+type Tester interface {
+	RunTest(*testing.T, func(params))
+}
+
+var (
+	myMysql Tester = &myMysqlDB{}
+	goMysql Tester = &goMysqlDB{}
+	sqlite  Tester = sqliteDB{}
+	pq      Tester = &pqDB{}
+	oracle  Tester = &oracleDB{}
+)
+
+const TablePrefix = "gosqltest_"
+
+// pqDB validates the postgres driver by Blake Mizerany (github.com/bmizerany/pq.go)
+type pqDB struct {
+	once    sync.Once // guards init of running
+	running bool      // whether port 5432 is listening
+}
+
+func (p *pqDB) RunTest(t *testing.T, fn func(params)) {
+	if !p.Running() {
+		fmt.Printf("skipping test; no Postgres running on localhost:5432\n")
+		return
+	}
+	user := os.Getenv("GOSQLTEST_PQ_USER")
+	if user == "" {
+		user = os.Getenv("USER")
+	}
+
+	gosqlproxy.RegisterDSNTranslator("postgres", func(url *url.URL) string {
+		password, _ := url.User.Password()
+		return fmt.Sprintf("user=%s password=%s dbname=%s %s", url.User.Username(), password, strings.TrimPrefix(url.Path, "/"), url.RawQuery)
+	})
+
+	dbName := "gosqltest"
+	db, err := sql.Open("gosqlproxy", fmt.Sprintf("postgres://%s:localhost@bar/%s?sslmode=disable", user, dbName))
+	// db, err := sql.Open("postgres", fmt.Sprintf("user=%s password=foo dbname=%s sslmode=disable", user, dbName))
+	if err != nil {
+		t.Fatalf("error connecting: %v", err)
+	}
+
+	params := params{pq, t, db}
+
+	// Drop all tables in the test database.
+	rows, err := db.Query("SELECT table_name FROM information_schema.tables WHERE table_name LIKE '" +
+		TablePrefix + "%' AND table_schema = 'public'")
+	if err != nil {
+		t.Fatalf("failed to enumerate tables: %v", err)
+	}
+	for rows.Next() {
+		var table string
+		if rows.Scan(&table) == nil {
+			params.mustExec("DROP TABLE " + table)
+		}
+	}
+
+	fn(params)
+}
+
+func (p *pqDB) Running() bool {
+	p.once.Do(func() {
+		c, err := net.Dial("tcp", "localhost:5432")
+		if err == nil {
+			p.running = true
+			c.Close()
+		}
+	})
+	return p.running
+}
+
+type sqliteDB struct{}
+
+type myMysqlDB struct {
+	once    sync.Once // guards init of running
+	running bool      // whether port 3306 is listening
+}
+
+func (m *myMysqlDB) Running() bool {
+	m.once.Do(func() {
+		c, err := net.Dial("tcp", "localhost:3306")
+		if err == nil {
+			m.running = true
+			c.Close()
+		}
+	})
+	return m.running
+}
+
+type goMysqlDB struct {
+	once    sync.Once // guards init of running
+	running bool      // whether port 3306 is listening
+}
+
+func (m *goMysqlDB) Running() bool {
+	m.once.Do(func() {
+		c, err := net.Dial("tcp", "localhost:3306")
+		if err == nil {
+			m.running = true
+			c.Close()
+		}
+	})
+	return m.running
+}
+
+type oracleDB struct {
+	once    sync.Once // guards init of running
+	running bool      // whether port 1521 is listening
+}
+
+func (o *oracleDB) Running() bool {
+	o.once.Do(func() {
+		c, err := net.Dial("tcp", "localhost:1521")
+		if err == nil {
+			o.running = true
+			c.Close()
+		}
+	})
+	return o.running
+}
+
+type params struct {
+	dbType Tester
+	*testing.T
+	*sql.DB
+}
+
+func (t params) mustExec(sql string, args ...interface{}) sql.Result {
+	res, err := t.DB.Exec(sql, args...)
+	if err != nil {
+		t.Fatalf("Error running %q: %v", sql, err)
+	}
+	return res
+}
+
+var qrx = regexp.MustCompile(`\?`)
+
+// q converts "?" characters to $1, $2, $n on postgres, :1, :2, :n on Oracle
+func (t params) q(sql string) string {
+	var pref string
+	switch t.dbType {
+	case pq:
+		pref = "$"
+	case oracle:
+		pref = ":"
+	default:
+		return sql
+	}
+	n := 0
+	return qrx.ReplaceAllStringFunc(sql, func(string) string {
+		n++
+		return pref + strconv.Itoa(n)
+	})
+}
+
+func (sqliteDB) RunTest(t *testing.T, fn func(params)) {
+	tempDir, err := ioutil.TempDir("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	gosqlproxy.RegisterDSNTranslator("sqlite3", func(url *url.URL) string {
+		return url.Path
+	})
+	// db, err := sql.Open("sqlite3", filepath.Join(tempDir, "foo.db"))
+	db, err := sql.Open("gosqlproxy", "sqlite3://"+filepath.Join(tempDir, "foo.db"))
+	if err != nil {
+		t.Fatalf("foo.db open fail: %v", err)
+	}
+	fn(params{sqlite, t, db})
+}
+
+func (m *myMysqlDB) RunTest(t *testing.T, fn func(params)) {
+	if !m.Running() {
+		t.Logf("skipping test; no MySQL running on localhost:3306")
+		return
+	}
+	user := os.Getenv("GOSQLTEST_MYSQL_USER")
+	if user == "" {
+		user = "root"
+	}
+	pass, ok := getenvOk("GOSQLTEST_MYSQL_PASS")
+	if !ok {
+		pass = "root"
+	}
+	dbName := "gosqltest"
+
+	gosqlproxy.RegisterDSNTranslator("mymysql", func(url *url.URL) string {
+		password, _ := url.User.Password()
+		return fmt.Sprintf("%s/%s/%s", url.User.Username(), password, strings.TrimPrefix(url.Path, "/"))
+	})
+
+	db, err := sql.Open("gosqlproxy", fmt.Sprintf("mymysql://%s:%s@localhost/%s", user, pass, dbName))
+	// db, err := sql.Open("mymysql", fmt.Sprintf("%s/%s/%s", dbName, user, pass))
+	if err != nil {
+		t.Fatalf("error connecting: %v", err)
+	}
+
+	params := params{myMysql, t, db}
+
+	// Drop all tables in the test database.
+	rows, err := db.Query("SHOW TABLES")
+	if err != nil {
+		t.Fatalf("failed to enumerate tables: %v", err)
+	}
+	for rows.Next() {
+		var table string
+		if rows.Scan(&table) == nil &&
+			strings.HasPrefix(strings.ToLower(table), strings.ToLower(TablePrefix)) {
+			params.mustExec("DROP TABLE " + table)
+		}
+	}
+
+	fn(params)
+}
+
+func (m *goMysqlDB) RunTest(t *testing.T, fn func(params)) {
+	if !m.Running() {
+		t.Logf("skipping test; no MySQL running on localhost:3306")
+		return
+	}
+	user := os.Getenv("GOSQLTEST_MYSQL_USER")
+	if user == "" {
+		user = "root"
+	}
+	pass, ok := getenvOk("GOSQLTEST_MYSQL_PASS")
+	if !ok {
+		pass = "root"
+	}
+	dbName := "gosqltest"
+	// db, err := sql.Open("mysql", fmt.Sprintf("%s:%s@/%s", user, pass, dbName))
+	db, err := sql.Open("gosqlproxy", fmt.Sprintf("mysql:%s:%s@/%s", user, pass, dbName))
+	if err != nil {
+		t.Fatalf("error connecting: %v", err)
+	}
+
+	params := params{goMysql, t, db}
+
+	// Drop all tables in the test database.
+	rows, err := db.Query("SHOW TABLES")
+	if err != nil {
+		t.Fatalf("failed to enumerate tables: %v", err)
+	}
+	for rows.Next() {
+		var table string
+		if rows.Scan(&table) == nil &&
+			strings.HasPrefix(strings.ToLower(table), strings.ToLower(TablePrefix)) {
+			params.mustExec("DROP TABLE " + table)
+		}
+	}
+
+	fn(params)
+}
+
+func (o *oracleDB) RunTest(t *testing.T, fn func(params)) {
+	if !o.Running() {
+		t.Logf("skipping test; no Oracle running on localhost:1521")
+		return
+	}
+
+	gosqlproxy.RegisterDSNTranslator("gosqlproxy", func(*url.URL) string {
+		return os.Getenv("GOSQLTEST_ORACLE") // !nashtsai! HACK pure override here
+	})
+
+	db, err := sql.Open("gosqlproxy", "goracle:localhost/"+os.Getenv("GOSQLTEST_ORACLE"))
+	// db, err := sql.Open("goracle", os.Getenv("GOSQLTEST_ORACLE"))
+	if err != nil {
+		t.Fatalf("error connecting: %v", err)
+	}
+	defer db.Close()
+
+	params := params{oracle, t, db}
+
+	// Drop all tables in the test database.
+	rows, err := db.Query(`SELECT table_name FROM user_tables
+		WHERE UPPER(table_name) LIKE UPPER('` + TablePrefix + `%')`)
+	if err != nil {
+		t.Fatalf("failed to enumerate tables: %v", err)
+	}
+	var table sql.NullString
+	for rows.Next() {
+		err = rows.Scan(&table)
+		// t.Logf("Next => table=%+v err=%s", table, err)
+		if err != nil {
+			t.Fatalf("error reading table name: %s", err)
+		} else if !table.Valid {
+			t.Fatalf("error reading table name: null value!")
+		} else {
+			params.mustExec("DROP TABLE " + table.String)
+		}
+	}
+
+	fn(params)
+}
+
+func sqlBlobParam(t params, size int) string {
+	switch t.dbType {
+	case sqlite:
+		return fmt.Sprintf("blob[%d]", size)
+	case pq:
+		return "bytea"
+	case oracle:
+		return fmt.Sprintf("RAW(%d)", size)
+	}
+	return fmt.Sprintf("VARBINARY(%d)", size)
+}
+
+func TestBlobs_SQLite(t *testing.T)  { sqlite.RunTest(t, testBlobs) }
+func TestBlobs_MyMySQL(t *testing.T) { myMysql.RunTest(t, testBlobs) }
+func TestBlobs_GoMySQL(t *testing.T) { goMysql.RunTest(t, testBlobs) }
+func TestBlobs_PQ(t *testing.T)      { pq.RunTest(t, testBlobs) }
+func TestBlobs_Oracle(t *testing.T)  { oracle.RunTest(t, testBlobs) }
+
+func testBlobs(t params) {
+	var blob = []byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+	t.mustExec("create table " + TablePrefix + "foo (id integer primary key, bar " + sqlBlobParam(t, 16) + ")")
+	t.mustExec(t.q("insert into "+TablePrefix+"foo (id, bar) values(?,?)"), 0, blob)
+
+	want := fmt.Sprintf("%x", blob)
+
+	b := make([]byte, 16)
+	err := t.QueryRow(t.q("select bar from "+TablePrefix+"foo where id = ?"), 0).Scan(&b)
+	got := fmt.Sprintf("%x", b)
+	if err != nil {
+		t.Errorf("[]byte scan: %v", err)
+	} else if got != want {
+		t.Errorf("for []byte, got %q; want %q", got, want)
+	}
+
+	err = t.QueryRow(t.q("select bar from "+TablePrefix+"foo where id = ?"), 0).Scan(&got)
+	want = string(blob)
+	if err != nil {
+		t.Errorf("string scan: %v", err)
+	} else if got != want {
+		t.Errorf("for string, got %q; want %q", got, want)
+	}
+}
+
+func TestManyQueryRow_SQLite(t *testing.T)  { sqlite.RunTest(t, testManyQueryRow) }
+func TestManyQueryRow_MyMySQL(t *testing.T) { myMysql.RunTest(t, testManyQueryRow) }
+func TestManyQueryRow_GoMySQL(t *testing.T) { goMysql.RunTest(t, testManyQueryRow) }
+func TestManyQueryRow_PQ(t *testing.T)      { pq.RunTest(t, testManyQueryRow) }
+func TestManyQueryRow_Oracle(t *testing.T)  { oracle.RunTest(t, testManyQueryRow) }
+
+func testManyQueryRow(t params) {
+	if testing.Short() {
+		t.Logf("skipping in short mode")
+		return
+	}
+	t.mustExec("create table " + TablePrefix + "foo (id integer primary key, name varchar(50))")
+	t.mustExec(t.q("insert into "+TablePrefix+"foo (id, name) values(?,?)"), 1, "bob")
+	var name string
+	for i := 0; i < 10000; i++ {
+		err := t.QueryRow(t.q("select name from "+TablePrefix+"foo where id = ?"), 1).Scan(&name)
+		if err != nil || name != "bob" {
+			t.Fatalf("on query %d: err=%v, name=%q", i, err, name)
+		}
+	}
+}
+
+func TestTxQuery_SQLite(t *testing.T)  { sqlite.RunTest(t, testTxQuery) }
+func TestTxQuery_MyMySQL(t *testing.T) { myMysql.RunTest(t, testTxQuery) }
+func TestTxQuery_GoMySQL(t *testing.T) { goMysql.RunTest(t, testTxQuery) }
+func TestTxQuery_PQ(t *testing.T)      { pq.RunTest(t, testTxQuery) }
+func TestTxQuery_Oracle(t *testing.T)  { oracle.RunTest(t, testTxQuery) }
+
+func testTxQuery(t params) {
+	tx, err := t.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	_, err = t.DB.Exec("create table " + TablePrefix + "foo (id integer primary key, name varchar(50))")
+	if err != nil {
+		t.Logf("cannot drop table "+TablePrefix+"foo: %s", err)
+	}
+
+	_, err = tx.Exec(t.q("insert into "+TablePrefix+"foo (id, name) values(?,?)"), 1, "bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := tx.Query(t.q("select name from "+TablePrefix+"foo where id = ?"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	if !r.Next() {
+		if r.Err() != nil {
+			t.Fatal(err)
+		}
+		t.Fatal("expected one rows")
+	}
+
+	var name string
+	err = r.Scan(&name)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPreparedStmt_SQLite(t *testing.T)  { sqlite.RunTest(t, testPreparedStmt) }
+func TestPreparedStmt_MyMySQL(t *testing.T) { myMysql.RunTest(t, testPreparedStmt) }
+func TestPreparedStmt_GoMySQL(t *testing.T) { goMysql.RunTest(t, testPreparedStmt) }
+func TestPreparedStmt_PQ(t *testing.T)      { pq.RunTest(t, testPreparedStmt) }
+func TestPreparedStmt_Oracle(t *testing.T)  { oracle.RunTest(t, testPreparedStmt) }
+
+func testPreparedStmt(t params) {
+	t.mustExec("CREATE TABLE " + TablePrefix + "t (count INT)")
+	sel, err := t.Prepare("SELECT count FROM " + TablePrefix + "t ORDER BY count DESC")
+	if err != nil {
+		t.Fatalf("prepare 1: %v", err)
+	}
+	ins, err := t.Prepare(t.q("INSERT INTO " + TablePrefix + "t (count) VALUES (?)"))
+	if err != nil {
+		t.Fatalf("prepare 2: %v", err)
+	}
+
+	for n := 1; n <= 3; n++ {
+		if _, err := ins.Exec(n); err != nil {
+			t.Fatalf("insert(%d) = %v", n, err)
+		}
+	}
+
+	const nRuns = 10
+	ch := make(chan bool)
+	for i := 0; i < nRuns; i++ {
+		go func() {
+			defer func() {
+				ch <- true
+			}()
+			for j := 0; j < 10; j++ {
+				count := 0
+				if err := sel.QueryRow().Scan(&count); err != nil && err != sql.ErrNoRows {
+					t.Errorf("Query: %v", err)
+					return
+				}
+				if _, err := ins.Exec(rand.Intn(100)); err != nil {
+					t.Errorf("Insert: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	for i := 0; i < nRuns; i++ {
+		<-ch
+	}
+}
+
+func getenvOk(k string) (v string, ok bool) {
+	v = os.Getenv(k)
+	if v != "" {
+		return v, true
+	}
+	keq := k + "="
+	for _, kv := range os.Environ() {
+		if kv == keq {
+			return "", true
+		}
+	}
+	return "", false
+}
+
+// func TestSql(t *testing.T) {
+// 	user := os.Getenv("GOSQLTEST_MYSQL_USER")
+// 	if user == "" {
+// 		user = "root"
+// 	}
+// 	pass, ok := getenvOk("GOSQLTEST_MYSQL_PASS")
+// 	if !ok {
+// 		pass = "root"
+// 	}
+// 	dbName := "gosqltest"
+
+// 	db, err := sql.Open("mymysql", fmt.Sprintf("%s/%s/%s", dbName, user, pass))
+// 	if err != nil {
+// 		t.Fatalf("error connecting: %v", err)
+// 	}
+
+// 	// Drop all tables in the test database.
+// 	stmts, err := db.Prepare("SHOW TABLES")
+// 	if err != nil {
+// 		t.Fatalf("failed to Prepare 'SHOW TABLES': %v", err)
+// 	}
+// 	rows, err := stmts.Query()
+// 	if err != nil {
+// 		t.Fatalf("failed to enumerate tables: %v", err)
+// 	}
+// 	for rows.Next() {
+// 		var table string
+// 		if rows.Scan(&table) == nil &&
+// 			strings.HasPrefix(strings.ToLower(table), strings.ToLower(TablePrefix)) {
+
+// 			db.Exec("DROP TABLE " + table)
+// 		}
+// 	}
+
+// }
