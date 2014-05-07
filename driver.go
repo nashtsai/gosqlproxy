@@ -122,7 +122,7 @@ const (
 )
 
 var (
-	dnsTranslators              map[string]func(*url.URL) string
+	dsnTranslators              map[string]func(*url.URL) string
 	masterCounter, slaveCounter uint32
 	initOnce                    sync.Once
 	enableDebug                 = false
@@ -180,6 +180,11 @@ func regKnownDSNTranslators() {
 	for driverName, v := range knownDrivers {
 		_, err := sql.Open(driverName, "")
 		if err == nil {
+			if dsnTranslators != nil { // !nashtsai! does not override
+				if _, has := dsnTranslators[driverName]; has {
+					continue
+				}
+			}
 			RegisterDSNTranslator(driverName, v)
 		} else {
 			// fmt.Printf("driver failed: %v | err: %v\n", driverName, err)
@@ -217,10 +222,10 @@ func RegisterDSNTranslator(driverName string, translator func(*url.URL) string) 
 		err = errors.New("driver name is empty")
 		return
 	}
-	if dnsTranslators == nil {
-		dnsTranslators = make(map[string]func(*url.URL) string, 0)
+	if dsnTranslators == nil {
+		dsnTranslators = make(map[string]func(*url.URL) string, 0)
 	}
-	dnsTranslators[driverName] = translator
+	dsnTranslators[driverName] = translator
 	return
 }
 
@@ -256,8 +261,8 @@ func (d *ProxyDriver) Open(name string) (driver.Conn, error) {
 				}
 			}
 
-			if dnsTranslators != nil {
-				if translator, has := dnsTranslators[urlS.Scheme]; has {
+			if dsnTranslators != nil {
+				if translator, has := dsnTranslators[urlS.Scheme]; has {
 					dataSourceName = translator(urlS)
 					DebugLog("translated from: [%s] to [%s]", i, dataSourceName)
 				}
