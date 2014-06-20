@@ -399,7 +399,7 @@ func (c *ProxyConn) Prepare(query string) (driver.Stmt, error) {
 			DebugLog("dbHandles:%v | has: %t", dbHandles, has)
 			dbHandleSize = len(dbHandles)
 			if !has || dbHandleSize == 0 {
-				return nil, errors.New("ster DB, cannot proceed SQL write operation: " + query)
+				return nil, errors.New("slave DB, cannot proceed SQL write operation: " + query)
 			}
 			stepping = &masterCounter
 		}
