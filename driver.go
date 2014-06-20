@@ -137,6 +137,10 @@ var (
 type DSNInfo struct {
 	dbHandlesMap map[role][]*sql.DB
 	asyncWrite   bool
+
+	execChan   chan *ExecCtx
+	resultChan chan *ExecCtx
+	quitChan   chan int
 }
 
 func NewDSNInfo() *DSNInfo {
@@ -146,23 +150,16 @@ func NewDSNInfo() *DSNInfo {
 	}
 }
 
+func (dnsInfo *DSNInfo) setupAsync() {
+	dnsInfo.execChan = make(chan *ExecCtx)
+	dnsInfo.resultChan = make(chan *ExecCtx)
+	dnsInfo.quitChan = make(chan int)
+
+	go asyncWriteProcessor(dnsInfo.execChan, dnsInfo.resultChan, dnsInfo.quitChan)
+}
+
 type ProxyDriver struct {
 	dbNameHandlesMap map[string]*DSNInfo
-}
-
-type ProxyConn struct {
-	name string
-	// dbHandlesMap *map[role][]*sql.DB
-	dsnInfo *DSNInfo
-	tx      *sql.Tx
-	stmt    *ProxyStmt
-	driver  *ProxyDriver
-}
-
-type ProxyStmt struct {
-	conn       *ProxyConn
-	stmt       *sql.Stmt
-	inputCount int
 }
 
 // type ProxyResult struct {
@@ -351,11 +348,17 @@ func (d *ProxyDriver) Open(name string) (driver.Conn, error) {
 		}
 	}
 
-	return &ProxyConn{name: name, dsnInfo: dsnInfo, driver: d}, nil
+	proxyConn := &ProxyConn{name: name, dsnInfo: dsnInfo, driver: d}
+	if dsnInfo.asyncWrite {
+		dsnInfo.setupAsync()
+	}
+	return proxyConn, nil
 }
 
 func (d *ProxyDriver) cleanup(name string) {
+
 	if dsnInfo, has := d.dbNameHandlesMap[name]; has {
+		dsnInfo.quitChan <- 0
 		for _, v := range dsnInfo.dbHandlesMap {
 			for _, vv := range v {
 				vv.Close()
@@ -363,6 +366,30 @@ func (d *ProxyDriver) cleanup(name string) {
 		}
 		delete(d.dbNameHandlesMap, name)
 	}
+}
+
+func asyncWriteProcessor(execChan chan *ExecCtx, resultChan chan *ExecCtx, quit chan int) {
+	runtime.LockOSThread()
+
+	for {
+		select {
+		case execCtx := <-execChan:
+			execCtx.Exec()
+			resultChan <- execCtx
+		case <-quit:
+			return
+		}
+	}
+	runtime.UnlockOSThread()
+}
+
+type ProxyConn struct {
+	name string
+	// dbHandlesMap *map[role][]*sql.DB
+	dsnInfo *DSNInfo
+	tx      *sql.Tx
+	stmt    *ProxyStmt
+	driver  *ProxyDriver
 }
 
 func (c *ProxyConn) Prepare(query string) (driver.Stmt, error) {
@@ -374,6 +401,7 @@ func (c *ProxyConn) Prepare(query string) (driver.Stmt, error) {
 	var has bool
 	var dbHandleSize int
 	var stepping *uint32
+	var asyncInsert bool
 	if strings.HasPrefix(queryLower, "select ") {
 		stepping = &slaveCounter
 		dbHandles, has = (*c.dsnInfo).dbHandlesMap[slaveRole]
@@ -392,18 +420,17 @@ func (c *ProxyConn) Prepare(query string) (driver.Stmt, error) {
 		}
 	} else {
 
-		if c.dsnInfo.asyncWrite {
-
-		} else {
-			dbHandles, has = (*c.dsnInfo).dbHandlesMap[masterRole]
-			DebugLog("dbHandles:%v | has: %t", dbHandles, has)
-			dbHandleSize = len(dbHandles)
-			if !has || dbHandleSize == 0 {
-				return nil, errors.New("slave DB, cannot proceed SQL write operation: " + query)
-			}
-			stepping = &masterCounter
+		dbHandles, has = (*c.dsnInfo).dbHandlesMap[masterRole]
+		DebugLog("dbHandles:%v | has: %t", dbHandles, has)
+		dbHandleSize = len(dbHandles)
+		if !has || dbHandleSize == 0 {
+			return nil, errors.New("slave DB, cannot proceed SQL write operation: " + query)
 		}
+		stepping = &masterCounter
 
+		if strings.HasPrefix(queryLower, "insert ") {
+			asyncInsert = true
+		}
 	}
 
 	if dbHandleSize == 1 {
@@ -411,6 +438,7 @@ func (c *ProxyConn) Prepare(query string) (driver.Stmt, error) {
 	} else {
 		db = dbHandles[atomic.AddUint32(stepping, 1)%uint32(dbHandleSize)]
 	}
+
 	DebugLog("dbHandleSize:%v, db:%v, query:%s", dbHandleSize, db, query)
 
 	sqlStmt, err := db.Prepare(query)
@@ -418,7 +446,11 @@ func (c *ProxyConn) Prepare(query string) (driver.Stmt, error) {
 		return nil, err
 	} else {
 		// !nashtsai! TODO this required dialect design
-		return &ProxyStmt{conn: c, stmt: sqlStmt, inputCount: strings.Count(query, "?") + strings.Count(query, "$")}, err
+		return &ProxyStmt{conn: c,
+			stmt:        sqlStmt,
+			inputCount:  strings.Count(query, "?") + strings.Count(query, "$"),
+			asyncInsert: asyncInsert,
+		}, err
 	}
 }
 
@@ -458,6 +490,20 @@ func (c *ProxyConn) Begin() (tx driver.Tx, err error) {
 	return
 }
 
+type ProxyStmt struct {
+	conn        *ProxyConn
+	stmt        *sql.Stmt
+	inputCount  int
+	asyncInsert bool
+}
+
+type ExecCtx struct {
+	stmt   *sql.Stmt
+	args   []driver.Value
+	result driver.Result
+	err    error
+}
+
 func (s *ProxyStmt) Close() (err error) {
 	DebugLog("ProxyStmt.Close: %v | enter", s)
 	if s.stmt != nil {
@@ -489,10 +535,21 @@ func values2InterfaceArray(args []driver.Value) []interface{} {
 	return forwardArgs
 }
 
+func (execCtx *ExecCtx) Exec() {
+	execCtx.result, execCtx.err = execCtx.stmt.Exec(values2InterfaceArray(execCtx.args)...)
+}
+
 func (s *ProxyStmt) Exec(args []driver.Value) (result driver.Result, err error) {
+
 	DebugLog("ProxyStmt.Exec: %v | enter", s)
 	s.inputCount = len(args)
-	return s.stmt.Exec(values2InterfaceArray(args)...)
+	if s.asyncInsert { // !nash! async write is only efficient for INSERT statement
+		s.conn.dsnInfo.execChan <- &ExecCtx{args: args, stmt: s.stmt}
+		result := <-s.conn.dsnInfo.resultChan // due to there is only 1 thread processor this will be expected result
+		return result.result, result.err
+	} else {
+		return s.stmt.Exec(values2InterfaceArray(args)...)
+	}
 }
 
 func (s *ProxyStmt) Query(args []driver.Value) (driver.Rows, error) {
