@@ -255,7 +255,7 @@ func (m *goMysqlDB) RunTest(t *testing.T, fn func(params)) {
 	})
 
 	// db, err := sql.Open("mysql", fmt.Sprintf("%s:%s@/%s", user, pass, dbName))
-	db, err := sql.Open("gosqlproxy", fmt.Sprintf("mysql://%s:%s@localhost/%s", user, pass, dbName))
+	db, err := sql.Open("gosqlproxy", fmt.Sprintf("mysql://%s:%s@localhost/%s;params://localhost/ddd?batchsize=50&asyncwrite=true", user, pass, dbName))
 	if err != nil {
 		t.Fatalf("error connecting: %v", err)
 	}

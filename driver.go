@@ -134,15 +134,29 @@ var (
 	gDriver                          *ProxyDriver
 )
 
+type DSNInfo struct {
+	dbHandlesMap map[role][]*sql.DB
+	asyncWrite   bool
+}
+
+func NewDSNInfo() *DSNInfo {
+	return &DSNInfo{
+		dbHandlesMap: make(map[role][]*sql.DB, 0),
+		asyncWrite:   false,
+	}
+}
+
 type ProxyDriver struct {
-	dbNameHandlesMap map[string]map[role][]*sql.DB
+	dbNameHandlesMap map[string]*DSNInfo
 }
 
 type ProxyConn struct {
-	name         string
-	dbHandlesMap *map[role][]*sql.DB
-	tx           *sql.Tx
-	stmt         *ProxyStmt
+	name string
+	// dbHandlesMap *map[role][]*sql.DB
+	dsnInfo *DSNInfo
+	tx      *sql.Tx
+	stmt    *ProxyStmt
+	driver  *ProxyDriver
 }
 
 type ProxyStmt struct {
@@ -177,7 +191,7 @@ func Init(maxIdleOpenConns, maxOpenConns int) {
 
 func Close() {
 	for _, v := range gDriver.dbNameHandlesMap {
-		for _, vv := range v {
+		for _, vv := range v.dbHandlesMap {
 			for _, vvv := range vv {
 				vvv.Close()
 			}
@@ -194,7 +208,7 @@ func regKnownDSNTranslators() {
 			password, _ := url.User.Password()
 			return fmt.Sprintf("user=%s password=%s dbname=%s %s", url.User.Username(), password, strings.TrimPrefix(url.Path, "/"), url.RawQuery)
 		},
-		"sqlite3": func(url *url.URL) string { return url.Path },
+		// "sqlite3": func(url *url.URL) string { return url.Path },
 		"mysql": func(url *url.URL) string {
 			password, _ := url.User.Password()
 			return fmt.Sprintf("%v:%v@%v", url.User.Username(), password, url.RequestURI())
@@ -254,20 +268,22 @@ func RegisterDSNTranslator(driverName string, translator func(*url.URL) string) 
 }
 
 // Only accept DSN common format (http://pear.php.net/manual/en/package.database.db.intro-dsn.php), multiple data sources separated by ';'
-// mysql://[username[:password]@][protocol[(address)]]/dbname[?param1=value1&...&paramN=valueN];mysql://[username[:password]@][protocol[(address)]]/dbname[?param1=value1&...&paramN=valueN]#slave
+// mysql://[username[:password]@][protocol[(address)]]/dbname[?param1=value1&...&paramN=valueN][#master];mysql://[username[:password]@][protocol[(address)]]/dbname[?param1=value1&...&paramN=valueN][#slave];params:///?asyncwrite=true
 func (d *ProxyDriver) Open(name string) (driver.Conn, error) {
 	DebugLog("ProxyDriver.Open: %v | name:%v", d, name)
 
 	initOnce.Do(regKnownDSNTranslators)
 
 	if d.dbNameHandlesMap == nil {
-		d.dbNameHandlesMap = make(map[string]map[role][]*sql.DB, 0)
+		d.dbNameHandlesMap = make(map[string]*DSNInfo, 0)
 	}
 
-	dbHandlesMap, has := d.dbNameHandlesMap[name]
+	dsnInfo, has := d.dbNameHandlesMap[name]
 	if !has {
-		dbHandlesMap = make(map[role][]*sql.DB, 0)
-		d.dbNameHandlesMap[name] = dbHandlesMap
+
+		dsnInfo = NewDSNInfo()
+		d.dbNameHandlesMap[name] = dsnInfo
+		dbHandlesMap := dsnInfo.dbHandlesMap
 		dsns := strings.Split(name, ";")
 		for _, i := range dsns {
 			urlS, err := url.Parse(i)
@@ -295,40 +311,52 @@ func (d *ProxyDriver) Open(name string) (driver.Conn, error) {
 				dataSourceName = urlS.RequestURI()
 				DebugLog("url from: [%s] to [%s]", i, dataSourceName)
 			}
-			InfoLog("DNS: [%v] | open DSN: [%v] | driver: %v", i, dataSourceName, driverName)
 
-			db, err := sql.Open(driverName, dataSourceName)
-			if err != nil {
-				d.cleanup(name)
-				return nil, err
-			}
-			if _maxIdleOpenConns > 0 {
-				db.SetMaxIdleConns(_maxIdleOpenConns)
-			}
-			if _maxOpenConns > 0 {
-				db.SetMaxOpenConns(_maxOpenConns)
-			}
+			if driverName == "params" {
+				query := urlS.Query()
+				asyncwrite := query.Get("asyncwrite")
 
-			var dbHandles []*sql.DB
-			var has bool
-			role := masterRole
-			if urlS.Fragment == "slave" {
-				role = slaveRole
+				InfoLog("DNS: [%v] | asyncwrite: %v", i, asyncwrite)
+				if asyncwrite == "true" {
+					dsnInfo.asyncWrite = true
+				}
+
+			} else {
+				InfoLog("DNS: [%v] | open DSN: [%v] | driver: %v", i, dataSourceName, driverName)
+
+				db, err := sql.Open(driverName, dataSourceName)
+				if err != nil {
+					d.cleanup(name)
+					return nil, err
+				}
+				if _maxIdleOpenConns > 0 {
+					db.SetMaxIdleConns(_maxIdleOpenConns)
+				}
+				if _maxOpenConns > 0 {
+					db.SetMaxOpenConns(_maxOpenConns)
+				}
+
+				var dbHandles []*sql.DB
+				var has bool
+				role := masterRole
+				if urlS.Fragment == "slave" {
+					role = slaveRole
+				}
+				if dbHandles, has = dbHandlesMap[role]; !has {
+					dbHandles = make([]*sql.DB, 0)
+					dbHandlesMap[role] = dbHandles
+				}
+				dbHandlesMap[role] = append(dbHandles, db)
 			}
-			if dbHandles, has = dbHandlesMap[role]; !has {
-				dbHandles = make([]*sql.DB, 0)
-				dbHandlesMap[role] = dbHandles
-			}
-			dbHandlesMap[role] = append(dbHandles, db)
 		}
 	}
 
-	return &ProxyConn{name: name, dbHandlesMap: &dbHandlesMap}, nil
+	return &ProxyConn{name: name, dsnInfo: dsnInfo, driver: d}, nil
 }
 
 func (d *ProxyDriver) cleanup(name string) {
-	if dbHandlesMap, has := d.dbNameHandlesMap[name]; has {
-		for _, v := range dbHandlesMap {
+	if dsnInfo, has := d.dbNameHandlesMap[name]; has {
+		for _, v := range dsnInfo.dbHandlesMap {
 			for _, vv := range v {
 				vv.Close()
 			}
@@ -348,14 +376,14 @@ func (c *ProxyConn) Prepare(query string) (driver.Stmt, error) {
 	var stepping *uint32
 	if strings.HasPrefix(queryLower, "select ") {
 		stepping = &slaveCounter
-		dbHandles, has = (*c.dbHandlesMap)[slaveRole]
+		dbHandles, has = (*c.dsnInfo).dbHandlesMap[slaveRole]
 		dbHandleSize = len(dbHandles)
 		if has && dbHandleSize == 0 {
-			dbHandles = (*c.dbHandlesMap)[masterRole] // using master's db handles if no slave db provided
+			dbHandles = (*c.dsnInfo).dbHandlesMap[masterRole] // using master's db handles if no slave db provided
 			dbHandleSize = len(dbHandles)
 			stepping = &masterCounter
 		} else {
-			dbHandles = (*c.dbHandlesMap)[masterRole]
+			dbHandles = (*c.dsnInfo).dbHandlesMap[masterRole]
 			dbHandleSize = len(dbHandles)
 			stepping = &masterCounter
 		}
@@ -363,13 +391,19 @@ func (c *ProxyConn) Prepare(query string) (driver.Stmt, error) {
 			return nil, errors.New("has no opened DB, how could this happen!?")
 		}
 	} else {
-		dbHandles, has = (*c.dbHandlesMap)[masterRole]
-		DebugLog("dbHandles:%v | has: %t", dbHandles, has)
-		dbHandleSize = len(dbHandles)
-		if !has || dbHandleSize == 0 {
-			return nil, errors.New("ster DB, cannot proceed SQL write operation: " + query)
+
+		if c.dsnInfo.asyncWrite {
+
+		} else {
+			dbHandles, has = (*c.dsnInfo).dbHandlesMap[masterRole]
+			DebugLog("dbHandles:%v | has: %t", dbHandles, has)
+			dbHandleSize = len(dbHandles)
+			if !has || dbHandleSize == 0 {
+				return nil, errors.New("ster DB, cannot proceed SQL write operation: " + query)
+			}
+			stepping = &masterCounter
 		}
-		stepping = &masterCounter
+
 	}
 
 	if dbHandleSize == 1 {
@@ -408,7 +442,7 @@ func (c *ProxyConn) Close() (err error) {
 func (c *ProxyConn) Begin() (tx driver.Tx, err error) {
 	DebugLog("ProxyConn.Begin: %v | enter", c)
 	var db *sql.DB
-	dbHandles, has := (*c.dbHandlesMap)[masterRole]
+	dbHandles, has := (*c.dsnInfo).dbHandlesMap[masterRole]
 	dbHandleSize := len(dbHandles)
 	if !has || dbHandleSize == 0 {
 		return nil, errors.New("has no master DB, cannot BEGIN a TX")
