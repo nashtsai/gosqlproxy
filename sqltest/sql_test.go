@@ -331,7 +331,7 @@ func sqlBlobParam(t params, size int) string {
 	return fmt.Sprintf("VARBINARY(%d)", size)
 }
 
-func TestBlobs_SQLite(t *testing.T)  { sqlite.RunTest(t, testBlobs) }
+// func TestBlobs_SQLite(t *testing.T)  { sqlite.RunTest(t, testBlobs) }
 func TestBlobs_MyMySQL(t *testing.T) { myMysql.RunTest(t, testBlobs) }
 func TestBlobs_GoMySQL(t *testing.T) { goMysql.RunTest(t, testBlobs) }
 func TestBlobs_PQ(t *testing.T)      { pq.RunTest(t, testBlobs) }
@@ -362,7 +362,7 @@ func testBlobs(t params) {
 	}
 }
 
-func TestManyQueryRow_SQLite(t *testing.T)  { sqlite.RunTest(t, testManyQueryRow) }
+// func TestManyQueryRow_SQLite(t *testing.T)  { sqlite.RunTest(t, testManyQueryRow) }
 func TestManyQueryRow_MyMySQL(t *testing.T) { myMysql.RunTest(t, testManyQueryRow) }
 func TestManyQueryRow_GoMySQL(t *testing.T) { goMysql.RunTest(t, testManyQueryRow) }
 func TestManyQueryRow_PQ(t *testing.T)      { pq.RunTest(t, testManyQueryRow) }
@@ -384,7 +384,7 @@ func testManyQueryRow(t params) {
 	}
 }
 
-func TestTxQuery_SQLite(t *testing.T)  { sqlite.RunTest(t, testTxQuery) }
+// func TestTxQuery_SQLite(t *testing.T)  { sqlite.RunTest(t, testTxQuery) }
 func TestTxQuery_MyMySQL(t *testing.T) { myMysql.RunTest(t, testTxQuery) }
 func TestTxQuery_GoMySQL(t *testing.T) { goMysql.RunTest(t, testTxQuery) }
 func TestTxQuery_PQ(t *testing.T)      { pq.RunTest(t, testTxQuery) }
@@ -427,7 +427,7 @@ func testTxQuery(t params) {
 	}
 }
 
-func TestPreparedStmt_SQLite(t *testing.T)  { sqlite.RunTest(t, testPreparedStmt) }
+// func TestPreparedStmt_SQLite(t *testing.T)  { sqlite.RunTest(t, testPreparedStmt) }
 func TestPreparedStmt_MyMySQL(t *testing.T) { myMysql.RunTest(t, testPreparedStmt) }
 func TestPreparedStmt_GoMySQL(t *testing.T) { goMysql.RunTest(t, testPreparedStmt) }
 func TestPreparedStmt_PQ(t *testing.T)      { pq.RunTest(t, testPreparedStmt) }
